@@ -1589,6 +1589,8 @@ async function loadAgents() {
     const container = document.getElementById('agents-container');
     // Always show agents section so "+ New Agent" button is accessible
     section.style.display = '';
+    // Keep shared cache in sync so modal can pull fresh description without refetch
+    missionAgentsList = data.agents || [];
     if (!data.agents || data.agents.length <= 1) {
       container.innerHTML = '<div class="text-xs text-gray-600 py-2">No agents yet. Click + New Agent to create one.</div>';
       return;
@@ -1614,11 +1616,16 @@ async function loadAgents() {
       const avatarImg = '<img src="' + avatarUrl + '" alt="" ' +
         'style="width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid ' + color + ';flex-shrink:0;background:#0a0a0a" ' +
         'onerror="this.remove()">';
+      const descText = (a.description || '').trim();
+      const descBlock = descText
+        ? '<div class="text-xs text-gray-400 mt-1" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.3" title="' + escapeHtml(descText) + '">' + escapeHtml(descText) + '</div>'
+        : '<div class="text-xs text-gray-600 italic mt-1">no description</div>';
       return '<div class="card clickable-card" style="min-width:150px;flex:1;max-width:220px;border-left:3px solid ' + color + '" data-agent="' + a.id + '" onclick="toggleAgentDetail(this.dataset.agent)">' +
         '<div style="display:flex;gap:10px;align-items:flex-start">' +
           avatarImg +
           '<div style="flex:1;min-width:0">' +
             '<div class="font-bold text-white text-sm">' + a.name + '</div>' +
+            descBlock +
             '<div class="text-xs mt-1">' + dot + ' ' + statusText + '</div>' +
             modelSelect +
             (a.running ? '<div class="text-xs text-gray-400 mt-1">' + a.todayTurns + ' turns</div>' : '') +
@@ -1699,6 +1706,19 @@ async function toggleAgentDetail(agentId) {
     var tasks = results[0], hive = results[1], convo = results[2];
     var html = '';
 
+    // Editable description (click to edit, Enter/blur saves, Esc cancels)
+    var descText = (agent && agent.description) ? agent.description : '';
+    var descDisplay = descText
+      ? escapeHtml(descText)
+      : '<span style="color:#4b5563;font-style:italic">Click to add description...</span>';
+    html += '<div id="agent-desc-block" style="margin-bottom:12px">' +
+      '<div class="text-xs text-gray-400 font-semibold mb-1 uppercase">Role</div>' +
+      '<div id="agent-desc-view" data-agent="' + agentId + '" data-raw="' + escapeHtml(descText) + '" onclick="editAgentDescription()" ' +
+        'style="background:#1a1a1a;border:1px dashed #2a2a2a;border-radius:6px;padding:8px;font-size:12px;color:#d1d5db;cursor:text;line-height:1.4" ' +
+        'title="Click to edit">' + descDisplay + '</div>' +
+      '<div id="agent-desc-status" class="text-xs mt-1" style="min-height:14px"></div>' +
+      '</div>';
+
     // Last conversation
     if (convo.turns && convo.turns.length > 0) {
       html += '<div class="text-xs text-gray-400 font-semibold mb-2 uppercase">Recent conversation</div>';
@@ -1750,6 +1770,83 @@ async function toggleAgentDetail(agentId) {
     if (!html) html = '<div class="text-gray-500 text-sm text-center py-8">No activity yet for this agent.</div>';
     body.innerHTML = html;
   } catch(e) { body.innerHTML = '<div class="text-red-400 text-sm text-center py-8">Failed to load agent details</div>'; }
+}
+
+function editAgentDescription() {
+  var view = document.getElementById('agent-desc-view');
+  if (!view || view.dataset.editing === '1') return;
+  var agentId = view.dataset.agent;
+  var current = view.dataset.raw || '';
+  view.dataset.editing = '1';
+  view.innerHTML = '<textarea id="agent-desc-input" style="width:100%;background:#0f0f0f;color:#e5e7eb;border:1px solid #2a2a2a;border-radius:4px;padding:6px;font-size:12px;font-family:inherit;resize:vertical;min-height:48px;box-sizing:border-box" maxlength="500"></textarea>';
+  var input = document.getElementById('agent-desc-input');
+  input.value = current;
+  input.focus();
+  input.select();
+  var saved = false;
+  var commit = function() {
+    if (saved) return;
+    saved = true;
+    saveAgentDescription(agentId, input.value);
+  };
+  var cancel = function() {
+    if (saved) return;
+    saved = true;
+    renderAgentDescription(agentId, current);
+  };
+  input.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('blur', commit);
+}
+
+function renderAgentDescription(agentId, descText) {
+  var view = document.getElementById('agent-desc-view');
+  if (!view) return;
+  view.dataset.editing = '';
+  view.dataset.raw = descText || '';
+  view.innerHTML = descText
+    ? escapeHtml(descText)
+    : '<span style="color:#4b5563;font-style:italic">Click to add description...</span>';
+  // Keep cached list in sync so card reflects change without full reload
+  var cached = missionAgentsList.find(function(a) { return a.id === agentId; });
+  if (cached) cached.description = descText || '';
+}
+
+async function saveAgentDescription(agentId, raw) {
+  var status = document.getElementById('agent-desc-status');
+  var trimmed = (raw || '').trim();
+  var view = document.getElementById('agent-desc-view');
+  var previous = view ? (view.dataset.raw || '') : '';
+  if (!trimmed) {
+    if (status) status.innerHTML = '<span style="color:#f87171">Description cannot be empty</span>';
+    renderAgentDescription(agentId, previous);
+    return;
+  }
+  if (trimmed === previous) { renderAgentDescription(agentId, previous); return; }
+  if (status) status.innerHTML = '<span style="color:#fbbf24">Saving...</span>';
+  try {
+    var res = await fetch(BASE + '/api/agents/' + agentId + '/description?token=' + TOKEN, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ description: trimmed }),
+    });
+    var data = await res.json();
+    if (res.ok && data.ok) {
+      renderAgentDescription(agentId, trimmed);
+      if (status) status.innerHTML = '<span style="color:#6ee7b7">Saved</span>';
+      setTimeout(function() { if (status) status.innerHTML = ''; }, 1500);
+      // Refresh card list so the new description shows on the card immediately
+      loadAgents();
+    } else {
+      if (status) status.innerHTML = '<span style="color:#f87171">' + escapeHtml(data.error || 'Save failed') + '</span>';
+      renderAgentDescription(agentId, previous);
+    }
+  } catch(e) {
+    if (status) status.innerHTML = '<span style="color:#f87171">Network error</span>';
+    renderAgentDescription(agentId, previous);
+  }
 }
 
 async function agentModalAction(agentId, action) {

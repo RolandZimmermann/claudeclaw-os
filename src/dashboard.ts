@@ -52,7 +52,14 @@ import {
 } from './db.js';
 import { generateContent, parseJsonResponse } from './gemini.js';
 import { getSecurityStatus } from './security.js';
-import { listAgentIds, loadAgentConfig, setAgentModel } from './agent-config.js';
+import {
+  listAgentIds,
+  loadAgentConfig,
+  setAgentModel,
+  setAgentDescription,
+  getMainDescription,
+  setMainDescription,
+} from './agent-config.js';
 import {
   listTemplates,
   validateAgentId,
@@ -1023,11 +1030,12 @@ export function startDashboard(botApi?: Api<RawApi>): void {
       }
     });
 
-    // Ensure main is first and not duplicated
+    // Ensure main is first and not duplicated.
+    // main-config.json is the source of truth for main's description (editable via dashboard),
+    // so override whatever came from agent.yaml or the fallback with getMainDescription().
     const hasMain = agentIds.includes('main');
     let allAgents = agents;
     if (!hasMain) {
-      // No agents/main/agent.yaml — add a fallback entry
       const mainPidFile = path.join(STORE_DIR, 'claudeclaw.pid');
       let mainRunning = false;
       if (fs.existsSync(mainPidFile)) {
@@ -1039,13 +1047,12 @@ export function startDashboard(botApi?: Api<RawApi>): void {
       }
       const mainStats = getAgentTokenStats('main');
       allAgents = [
-        { id: 'main', name: 'Main', description: 'Primary ClaudeClaw bot', model: 'claude-opus-4-6', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost },
+        { id: 'main', name: 'Main', description: getMainDescription(), model: 'claude-opus-4-6', running: mainRunning, todayTurns: mainStats.todayTurns, todayCost: mainStats.todayCost },
         ...agents,
       ];
     } else {
-      // main exists in agentIds — move it to the front
       allAgents = [
-        ...agents.filter((a) => a.id === 'main'),
+        ...agents.filter((a) => a.id === 'main').map((a) => ({ ...a, description: getMainDescription() })),
         ...agents.filter((a) => a.id !== 'main'),
       ];
     }
@@ -1074,6 +1081,26 @@ export function startDashboard(botApi?: Api<RawApi>): void {
     const agentId = c.req.param('id');
     const stats = getAgentTokenStats(agentId);
     return c.json(stats);
+  });
+
+  // Update agent description
+  app.patch('/api/agents/:id/description', async (c) => {
+    const agentId = c.req.param('id');
+    const body = await c.req.json<{ description?: string }>();
+    const description = body?.description?.trim();
+    if (!description) return c.json({ error: 'description required' }, 400);
+    if (description.length > 500) return c.json({ error: 'description too long (max 500)' }, 400);
+
+    try {
+      if (agentId === 'main') {
+        setMainDescription(description);
+      } else {
+        setAgentDescription(agentId, description);
+      }
+      return c.json({ ok: true, agent: agentId, description });
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : 'Failed to update description' }, 500);
+    }
   });
 
   // Update ALL agent models at once. MUST be registered before the
