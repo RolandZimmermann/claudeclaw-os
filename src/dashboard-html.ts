@@ -2867,6 +2867,13 @@ let chatHistoryLoaded = false;
 let unreadCount = 0;
 let chatAgents = [];
 let activeAgentTab = 'all';
+// Per-agent "in flight" set. processing:true adds, processing:false removes.
+// Drives the typing indicator on tab switch so work you can't see is still
+// rendered when you return.
+const busyAgents = new Set();
+// Per-agent unread set. Populated when an assistant_message lands on a tab
+// that isn't currently active.
+const unreadAgents = new Set();
 
 function openChat() {
   chatOpen = true;
@@ -2910,14 +2917,54 @@ async function loadAgentTabs() {
     chatAgents.forEach(function(a) {
       const tab = document.createElement('button');
       tab.className = 'chat-agent-tab' + (activeAgentTab === a.id ? ' active' : '');
+      tab.dataset.agent = a.id;
       const dot = document.createElement('span');
       dot.className = 'agent-dot ' + (a.running ? 'live' : 'dead');
       tab.appendChild(dot);
       tab.appendChild(document.createTextNode(a.name || (a.id.charAt(0).toUpperCase() + a.id.slice(1))));
+      // Busy spinner (thinking) — separate from the green unread dot.
+      const busyMark = document.createElement('span');
+      busyMark.className = 'tab-busy';
+      busyMark.textContent = '…';
+      busyMark.style.cssText = 'display:none;margin-left:6px;color:#f59e0b;font-weight:bold';
+      tab.appendChild(busyMark);
+      const unreadDot = document.createElement('span');
+      unreadDot.className = 'tab-unread';
+      unreadDot.style.cssText = 'display:none;width:6px;height:6px;border-radius:50%;background:#22c55e;margin-left:6px;vertical-align:middle';
+      tab.appendChild(unreadDot);
       tab.onclick = function() { switchAgentTab(a.id, this); };
       container.appendChild(tab);
     });
+    refreshUnreadBadges();
+    refreshBusyBadges();
   } catch(e) { console.error('Agent tabs error', e); }
+}
+
+// Tab filter: "all" passes everything; an agent tab only renders events
+// whose agentId matches. Older events without agentId are treated as "main"
+// for backward compatibility.
+function eventBelongsToActiveTab(ev) {
+  if (activeAgentTab === 'all') return true;
+  const eventAgent = ev && ev.agentId ? ev.agentId : 'main';
+  return eventAgent === activeAgentTab;
+}
+
+function refreshUnreadBadges() {
+  document.querySelectorAll('.chat-agent-tab').forEach(function(tab) {
+    const agent = tab.dataset.agent;
+    const badge = tab.querySelector('.tab-unread');
+    if (!badge) return;
+    badge.style.display = (agent && unreadAgents.has(agent)) ? 'inline-block' : 'none';
+  });
+}
+
+function refreshBusyBadges() {
+  document.querySelectorAll('.chat-agent-tab').forEach(function(tab) {
+    const agent = tab.dataset.agent;
+    const busy = tab.querySelector('.tab-busy');
+    if (!busy) return;
+    busy.style.display = (agent && busyAgents.has(agent)) ? 'inline-block' : 'none';
+  });
 }
 
 function switchAgentTab(agentId, el) {
@@ -2925,6 +2972,15 @@ function switchAgentTab(agentId, el) {
   document.querySelectorAll('.chat-agent-tab').forEach(function(t) { t.classList.remove('active'); });
   if (el) el.classList.add('active');
   chatHistoryLoaded = false;
+  // Reconcile the shared typing/progress bar against the set of busy agents.
+  const hasBusy = activeAgentTab === 'all'
+    ? busyAgents.size > 0
+    : busyAgents.has(activeAgentTab);
+  if (hasBusy) showTyping(); else hideTyping();
+  // Clear unread for the newly-active agent.
+  if (agentId !== 'all') unreadAgents.delete(agentId);
+  else unreadAgents.clear();
+  refreshUnreadBadges();
   loadChatHistory();
   loadSessionInfo();
 }
@@ -2981,12 +3037,21 @@ function connectChatSSE() {
 
   chatSSE.addEventListener('user_message', function(e) {
     const ev = JSON.parse(e.data);
+    if (!eventBelongsToActiveTab(ev)) return;
     appendChatBubble('user', ev.content, ev.source, true);
     if (!chatOpen) { unreadCount++; updateFabBadge(); }
   });
 
   chatSSE.addEventListener('assistant_message', function(e) {
     const ev = JSON.parse(e.data);
+    const evAgent = (ev && ev.agentId) ? ev.agentId : 'main';
+    if (!eventBelongsToActiveTab(ev)) {
+      // Reply landed on a tab the user isn't looking at — flag it.
+      unreadAgents.add(evAgent);
+      refreshUnreadBadges();
+      if (!chatOpen) { unreadCount++; updateFabBadge(); }
+      return;
+    }
     appendChatBubble('assistant', ev.content, ev.source, true);
     hideTyping();
     if (!chatOpen) { unreadCount++; updateFabBadge(); }
@@ -2995,11 +3060,16 @@ function connectChatSSE() {
 
   chatSSE.addEventListener('processing', function(e) {
     const ev = JSON.parse(e.data);
+    const evAgent = (ev && ev.agentId) ? ev.agentId : 'main';
+    if (ev.processing) busyAgents.add(evAgent); else busyAgents.delete(evAgent);
+    refreshBusyBadges();
+    if (!eventBelongsToActiveTab(ev)) return;
     if (ev.processing) showTyping(); else hideTyping();
   });
 
   chatSSE.addEventListener('progress', function(e) {
     const ev = JSON.parse(e.data);
+    if (!eventBelongsToActiveTab(ev)) return;
     showProgress(ev.description);
   });
 
@@ -3162,11 +3232,15 @@ async function sendChatMessage() {
   autoResizeInput();
   // Disable send while processing
   document.getElementById('chat-send-btn').disabled = true;
+  // Route to the selected agent tab. "All" falls back to main so the
+  // default send still hits the hosting process, matching historical
+  // behavior.
+  const targetAgent = activeAgentTab === 'all' ? 'main' : activeAgentTab;
   try {
     await fetch(BASE + '/api/chat/send?token=' + TOKEN, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message: text }),
+      body: JSON.stringify({ message: text, agent_id: targetAgent }),
     });
   } catch(e) {
     console.error('Send error', e);

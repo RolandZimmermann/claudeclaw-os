@@ -627,6 +627,27 @@ function runMigrations(database: Database.Database): void {
     database.exec(`ALTER TABLE meet_sessions ADD COLUMN provider TEXT NOT NULL DEFAULT 'pika'`);
     logger.info('Migration: added provider column to meet_sessions');
   }
+
+  // Per-agent dashboard chat: mission tasks now double as the cross-process
+  // transport for chat. type='async' keeps the existing one-shot behavior;
+  // type='chat' carries chat_id so the executing agent can save its turns
+  // under the correct dashboard chat scope. Re-pragma here so we see the
+  // timeout_ms column added above — conditional ADD COLUMNs only check
+  // for the name they're about to add, so column-order doesn't matter.
+  const missionCols3 = database.prepare(`PRAGMA table_info(mission_tasks)`).all() as Array<{ name: string }>;
+  if (!missionCols3.find((c) => c.name === 'type')) {
+    database.exec(`ALTER TABLE mission_tasks ADD COLUMN type TEXT NOT NULL DEFAULT 'async'`);
+    logger.info('Migration: added mission_tasks.type column');
+  }
+  if (!missionCols3.find((c) => c.name === 'chat_id')) {
+    database.exec(`ALTER TABLE mission_tasks ADD COLUMN chat_id TEXT`);
+    logger.info('Migration: added mission_tasks.chat_id column');
+  }
+
+  // Per-agent conversation queries need an index that matches their WHERE.
+  database.exec(
+    `CREATE INDEX IF NOT EXISTS idx_convo_log_chat_agent ON conversation_log(chat_id, agent_id, created_at DESC)`,
+  );
 }
 
 /** @internal - for tests only. Creates a fresh in-memory database. */
@@ -1344,14 +1365,14 @@ export function getRecentConversation(
       .prepare(
         `SELECT * FROM conversation_log
          WHERE chat_id = ? AND agent_id = ?
-         ORDER BY created_at DESC LIMIT ?`,
+         ORDER BY created_at DESC, id DESC LIMIT ?`,
       )
       .all(chatId, agentId, limit) as ConversationTurn[];
   }
   return db
     .prepare(
       `SELECT * FROM conversation_log WHERE chat_id = ?
-       ORDER BY created_at DESC LIMIT ?`,
+       ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
     .all(chatId, limit) as ConversationTurn[];
 }
@@ -1403,7 +1424,17 @@ export function getConversationPage(
   chatId: string,
   limit = 40,
   beforeId?: number,
+  agentId?: string,
 ): ConversationTurn[] {
+  if (beforeId && agentId) {
+    return db
+      .prepare(
+        `SELECT * FROM conversation_log
+         WHERE chat_id = ? AND agent_id = ? AND id < ?
+         ORDER BY id DESC LIMIT ?`,
+      )
+      .all(chatId, agentId, beforeId, limit) as ConversationTurn[];
+  }
   if (beforeId) {
     return db
       .prepare(
@@ -1412,6 +1443,15 @@ export function getConversationPage(
          ORDER BY id DESC LIMIT ?`,
       )
       .all(chatId, beforeId, limit) as ConversationTurn[];
+  }
+  if (agentId) {
+    return db
+      .prepare(
+        `SELECT * FROM conversation_log
+         WHERE chat_id = ? AND agent_id = ?
+         ORDER BY id DESC LIMIT ?`,
+      )
+      .all(chatId, agentId, limit) as ConversationTurn[];
   }
   return db
     .prepare(
@@ -1845,7 +1885,7 @@ export function getAgentRecentConversation(agentId: string, chatId: string, limi
   return db
     .prepare(
       `SELECT * FROM conversation_log WHERE agent_id = ? AND chat_id = ?
-       ORDER BY created_at DESC LIMIT ?`,
+       ORDER BY created_at DESC, id DESC LIMIT ?`,
     )
     .all(agentId, chatId, limit) as ConversationTurn[];
 }
@@ -1966,6 +2006,8 @@ export interface MissionTask {
   created_by: string;
   priority: number;
   timeout_ms: number | null;
+  type: string;
+  chat_id: string | null;
   created_at: number;
   started_at: number | null;
   completed_at: number | null;
@@ -1979,12 +2021,14 @@ export function createMissionTask(
   createdBy = 'dashboard',
   priority = 0,
   timeoutMs: number | null = null,
+  type: 'async' | 'chat' = 'async',
+  chatId: string | null = null,
 ): void {
   const now = Math.floor(Date.now() / 1000);
   db.prepare(
-    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, timeout_ms, created_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
-  ).run(id, title, prompt, assignedAgent, createdBy, priority, timeoutMs, now);
+    `INSERT INTO mission_tasks (id, title, prompt, assigned_agent, status, created_by, priority, timeout_ms, type, chat_id, created_at)
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)`,
+  ).run(id, title, prompt, assignedAgent, createdBy, priority, timeoutMs, type, chatId, now);
 }
 
 export function updateMissionTaskTimeout(id: string, timeoutMs: number): boolean {
@@ -2000,13 +2044,23 @@ export function updateMissionTaskTimeout(id: string, timeoutMs: number): boolean
 export function getUnassignedMissionTasks(): MissionTask[] {
   return db
     .prepare(
-      `SELECT * FROM mission_tasks WHERE assigned_agent IS NULL AND status = 'queued'
+      `SELECT * FROM mission_tasks
+       WHERE assigned_agent IS NULL AND status = 'queued' AND type = 'async'
        ORDER BY priority DESC, created_at ASC`,
     )
     .all() as MissionTask[];
 }
 
-export function getMissionTasks(agentId?: string, status?: string): MissionTask[] {
+/**
+ * List mission tasks for the Mission Control UI. Chat-type tasks are the
+ * transport for dashboard per-agent chat and are excluded by default so
+ * they don't pollute the task list. Pass `includeChat: true` for debug.
+ */
+export function getMissionTasks(
+  agentId?: string,
+  status?: string,
+  includeChat = false,
+): MissionTask[] {
   const conditions: string[] = [];
   const params: unknown[] = [];
 
@@ -2017,6 +2071,9 @@ export function getMissionTasks(agentId?: string, status?: string): MissionTask[
   if (status) {
     conditions.push('status = ?');
     params.push(status);
+  }
+  if (!includeChat) {
+    conditions.push("type = 'async'");
   }
 
   const where = conditions.length > 0 ? ' WHERE ' + conditions.join(' AND ') : '';
@@ -2102,11 +2159,17 @@ export function assignMissionTask(id: string, agent: string): boolean {
 }
 
 export function getMissionTaskHistory(limit = 30, offset = 0): { tasks: MissionTask[]; total: number } {
+  // Exclude chat-type tasks — they're dashboard-scoped chat turns, not
+  // Mission Control work items. Showing them would pollute the history view.
   const total = (db.prepare(
-    `SELECT COUNT(*) as c FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled')`,
+    `SELECT COUNT(*) as c FROM mission_tasks
+       WHERE status IN ('completed', 'failed', 'cancelled')
+         AND (type IS NULL OR type = 'async')`,
   ).get() as { c: number }).c;
   const tasks = db.prepare(
-    `SELECT * FROM mission_tasks WHERE status IN ('completed', 'failed', 'cancelled')
+    `SELECT * FROM mission_tasks
+       WHERE status IN ('completed', 'failed', 'cancelled')
+         AND (type IS NULL OR type = 'async')
      ORDER BY completed_at DESC LIMIT ? OFFSET ?`,
   ).all(limit, offset) as MissionTask[];
   return { tasks, total };

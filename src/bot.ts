@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -31,7 +32,7 @@ import {
   MEMORY_NOTIFY,
   PROJECT_ROOT,
 } from './config.js';
-import { clearSession, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
+import { clearSession, createMissionTask, getMissionTask, getRecentConversation, getRecentMemories, getRecentTaskOutputs, getSession, getSessionConversation, logToHiveMind, pinMemory, unpinMemory, setSession, lookupWaChatId, saveWaMessageMap, saveTokenUsage, saveCompactionEvent, getCompactionCount } from './db.js';
 import { logger } from './logger.js';
 import { downloadMedia, buildPhotoMessage, buildDocumentMessage, buildVideoMessage } from './media.js';
 import { buildMemoryContext, evaluateMemoryRelevance, saveConversationTurn, shouldNudgeMemory, MEMORY_NUDGE_TEXT } from './memory.js';
@@ -1617,8 +1618,113 @@ export function createBot(): Bot {
 }
 
 /**
- * Process a message sent from the dashboard web UI.
- * Runs the agent pipeline and relays the response to Telegram.
+ * Dispatch a dashboard chat message to another agent's process via the
+ * mission task queue. The target agent claims the task from its own
+ * scheduler loop, runs it with its own model / system prompt / memory /
+ * session, and saves the turns to conversation_log under its agent_id.
+ *
+ * This function watches the task for completion and emits SSE chat events
+ * so the dashboard frontend renders the response in the right tab.
+ */
+export function dispatchDashboardChatToAgent(
+  text: string,
+  targetAgentId: string,
+): void {
+  if (!ALLOWED_CHAT_ID) return;
+  const chatIdStr = ALLOWED_CHAT_ID;
+
+  emitChatEvent({
+    type: 'user_message',
+    chatId: chatIdStr,
+    agentId: targetAgentId,
+    content: text,
+    source: 'dashboard',
+  });
+
+  // Dead-agent short-circuit. If the target agent's process isn't running,
+  // the chat mission will never be claimed. Fail fast instead of waiting
+  // out the 10-minute poller.
+  if (targetAgentId !== AGENT_ID) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { isAgentRunning } = require('./agent-create.js') as typeof import('./agent-create.js');
+      if (!isAgentRunning(targetAgentId)) {
+        emitChatEvent({
+          type: 'error',
+          chatId: chatIdStr,
+          agentId: targetAgentId,
+          content: `Agent "${targetAgentId}" isn't running. Start it from Mission Control first.`,
+        });
+        return;
+      }
+    } catch (err) {
+      logger.warn({ err, targetAgentId }, 'Dead-agent pre-check failed; falling through to poll timeout');
+    }
+  }
+
+  // Per-agent processing indicator. Doesn't touch the global processing
+  // state because the work runs in another process.
+  emitChatEvent({ type: 'processing', chatId: chatIdStr, agentId: targetAgentId, processing: true });
+
+  const taskId = crypto.randomBytes(4).toString('hex');
+  const title = text.length > 60 ? text.slice(0, 60) + '...' : text;
+  // Chat-type mission: no per-task timeout override (pass null so scheduler
+  // falls back to MISSION_TIMEOUT_MS), type='chat', chat_id carries scope.
+  createMissionTask(taskId, title, text, targetAgentId, AGENT_ID, 5, null, 'chat', chatIdStr);
+
+  logger.info(
+    { taskId, targetAgentId, chatId: chatIdStr, messageLen: text.length },
+    'Dispatched dashboard chat to agent process',
+  );
+
+  const watchStart = Date.now();
+  const watchTimeoutMs = 10 * 60 * 1000;
+  const pollMs = 1000;
+  const poller = setInterval(() => {
+    const task = getMissionTask(taskId);
+    if (!task) {
+      clearInterval(poller);
+      return;
+    }
+    if (task.status === 'completed') {
+      clearInterval(poller);
+      emitChatEvent({ type: 'processing', chatId: chatIdStr, agentId: targetAgentId, processing: false });
+      emitChatEvent({
+        type: 'assistant_message',
+        chatId: chatIdStr,
+        agentId: targetAgentId,
+        content: task.result ?? 'Done.',
+        source: 'dashboard',
+      });
+      return;
+    }
+    if (task.status === 'failed' || task.status === 'cancelled') {
+      clearInterval(poller);
+      emitChatEvent({ type: 'processing', chatId: chatIdStr, agentId: targetAgentId, processing: false });
+      emitChatEvent({
+        type: 'error',
+        chatId: chatIdStr,
+        agentId: targetAgentId,
+        content: task.error ?? `Agent task ${task.status}.`,
+      });
+      return;
+    }
+    if (Date.now() - watchStart > watchTimeoutMs) {
+      clearInterval(poller);
+      emitChatEvent({ type: 'processing', chatId: chatIdStr, agentId: targetAgentId, processing: false });
+      emitChatEvent({
+        type: 'error',
+        chatId: chatIdStr,
+        agentId: targetAgentId,
+        content: 'Agent did not respond in time. Task left running in the background.',
+      });
+    }
+  }, pollMs);
+}
+
+/**
+ * Process a message sent from the dashboard web UI for the hosting agent.
+ * Sub-agent messages go via dispatchDashboardChatToAgent above.
  * Response is delivered via SSE (fire-and-forget from the caller's perspective).
  */
 export async function processMessageFromDashboard(
@@ -1641,8 +1747,8 @@ async function processDashboardMessage(
   text: string,
   chatIdStr: string,
 ): Promise<void> {
-  emitChatEvent({ type: 'user_message', chatId: chatIdStr, content: text, source: 'dashboard' });
-  setProcessing(chatIdStr, true);
+  emitChatEvent({ type: 'user_message', chatId: chatIdStr, agentId: AGENT_ID, content: text, source: 'dashboard' });
+  setProcessing(chatIdStr, true, AGENT_ID);
 
   try {
     const sessionId = getSession(chatIdStr, AGENT_ID);
@@ -1665,7 +1771,7 @@ async function processDashboardMessage(
     const fullMessage = dashParts.join('\n\n');
 
     const onProgress = (event: AgentProgressEvent) => {
-      emitChatEvent({ type: 'progress', chatId: chatIdStr, description: event.description });
+      emitChatEvent({ type: 'progress', chatId: chatIdStr, agentId: AGENT_ID, description: event.description });
     };
 
     const abortCtrl = new AbortController();
@@ -1694,7 +1800,7 @@ async function processDashboardMessage(
       const msg = result.text === null
         ? `Timed out after ${Math.round(AGENT_TIMEOUT_MS / 1000)}s. Try breaking the task into smaller steps.`
         : 'Stopped.';
-      emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: msg, source: 'dashboard' });
+      emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, agentId: AGENT_ID, content: msg, source: 'dashboard' });
       return;
     }
 
@@ -1710,16 +1816,9 @@ async function processDashboardMessage(
       void evaluateMemoryRelevance(dashSurfacedIds, dashSummaries, text, rawResponse).catch(() => {});
     }
 
-    // Emit assistant response to SSE clients
-    emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, content: rawResponse, source: 'dashboard' });
-
-    // Relay to Telegram so the user sees it there too
-    const { text: responseText } = extractFileMarkers(rawResponse);
-    if (responseText) {
-      for (const part of splitMessage(formatForTelegram(responseText))) {
-        await botApi.sendMessage(parseInt(chatIdStr), part, { parse_mode: 'HTML' });
-      }
-    }
+    // Emit assistant response to SSE clients. Dashboard chat and Telegram
+    // are distinct channels now — no Telegram mirror here.
+    emitChatEvent({ type: 'assistant_message', chatId: chatIdStr, agentId: AGENT_ID, content: rawResponse, source: 'dashboard' });
 
     // Log token usage
     if (result.usage) {
@@ -1743,9 +1842,9 @@ async function processDashboardMessage(
   } catch (err) {
     setActiveAbort(chatIdStr, null);
     logger.error({ err }, 'Dashboard message processing error');
-    emitChatEvent({ type: 'error', chatId: chatIdStr, content: 'Something went wrong. Check the logs.' });
+    emitChatEvent({ type: 'error', chatId: chatIdStr, agentId: AGENT_ID, content: 'Something went wrong. Check the logs.' });
   } finally {
-    setProcessing(chatIdStr, false);
+    setProcessing(chatIdStr, false, AGENT_ID);
   }
 }
 

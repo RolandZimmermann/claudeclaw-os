@@ -109,10 +109,10 @@ export function emitChatEvent(event: Omit<ChatEvent, 'timestamp'>): void {
 let _processing = false;
 let _processingChatId = '';
 
-export function setProcessing(chatId: string, v: boolean): void {
+export function setProcessing(chatId: string, v: boolean, agentId?: string): void {
   _processing = v;
   _processingChatId = v ? chatId : '';
-  emitChatEvent({ type: 'processing', chatId, processing: v });
+  emitChatEvent({ type: 'processing', chatId, agentId, processing: v });
 }
 
 export function getIsProcessing(): { processing: boolean; chatId: string } {

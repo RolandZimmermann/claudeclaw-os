@@ -73,7 +73,7 @@ import {
   suggestBotNames,
   isAgentRunning,
 } from './agent-create.js';
-import { processMessageFromDashboard } from './bot.js';
+import { dispatchDashboardChatToAgent, processMessageFromDashboard } from './bot.js';
 import { getDashboardHtml } from './dashboard-html.js';
 import { getWarRoomHtml } from './warroom-html.js';
 import { WARROOM_ENABLED, WARROOM_PORT } from './config.js';
@@ -1412,16 +1412,24 @@ export function startDashboard(botApi?: Api<RawApi>): void {
     return c.json({ turns });
   });
 
-  // Send message from dashboard
+  // Send message from dashboard.
+  // If agent_id is omitted or matches the hosting process, run in-process.
+  // Otherwise route via the mission-task queue to that agent's process.
   app.post('/api/chat/send', async (c) => {
     if (!botApi) return c.json({ error: 'Bot API not available' }, 503);
-    const body = await c.req.json<{ message?: string }>();
+    const body = await c.req.json<{ message?: string; agent_id?: string }>();
     const message = body?.message?.trim();
     if (!message) return c.json({ error: 'message required' }, 400);
 
+    const targetAgent = body?.agent_id?.trim() || AGENT_ID;
+
     // Fire-and-forget: response comes via SSE
-    void processMessageFromDashboard(botApi, message);
-    return c.json({ ok: true });
+    if (targetAgent === AGENT_ID) {
+      void processMessageFromDashboard(botApi, message);
+    } else {
+      dispatchDashboardChatToAgent(message, targetAgent);
+    }
+    return c.json({ ok: true, agent_id: targetAgent });
   });
 
   // Abort current processing
