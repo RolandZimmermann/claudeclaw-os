@@ -90,7 +90,7 @@ export interface ChatEvent {
   chatId: string;
   agentId?: string;
   content?: string;
-  source?: 'telegram' | 'dashboard' | 'signal';
+  source?: 'telegram' | 'dashboard' | 'signal' | 'matrix';
   description?: string;
   processing?: boolean;
   timestamp: number;

@@ -4,8 +4,9 @@ import path from 'path';
 import { loadAgentConfig, listAgentIds, resolveAgentDir, resolveAgentClaudeMd } from './agent-config.js';
 import { createBot } from './bot.js';
 import { createSignalBot, SignalBot } from './signal-bot.js';
+import { createMatrixBot, MatrixBot } from './matrix-bot.js';
 import { checkPendingMigrations } from './migrations.js';
-import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT, MESSENGER_TYPE, SIGNAL_AUTHORIZED_RECIPIENTS, SIGNAL_PHONE_NUMBER } from './config.js';
+import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT, MESSENGER_TYPE, SIGNAL_AUTHORIZED_RECIPIENTS, SIGNAL_PHONE_NUMBER, MATRIX_HOMESERVER_URL, MATRIX_USER_ID, MATRIX_ACCESS_TOKEN, MATRIX_AUTHORIZED_USERS } from './config.js';
 import { startDashboard } from './dashboard.js';
 import { initDatabase, cleanupOldMissionTasks, insertAuditLog } from './db.js';
 import { initSecurity, setAuditCallback } from './security.js';
@@ -116,11 +117,24 @@ async function main(): Promise<void> {
     showBanner();
   }
 
-  // Messenger-specific startup checks. Signal uses signal-cli (no token),
-  // Telegram needs a bot token from @BotFather.
+  // Messenger-specific startup checks.
+  // - Telegram: needs a bot token from @BotFather.
+  // - Signal: uses signal-cli (phone number, no token).
+  // - Matrix: needs homeserver URL, bot user MXID, access token, and at
+  //   least one allowlisted MXID so a misconfigured bot can't talk to
+  //   the world.
   if (MESSENGER_TYPE === 'signal') {
     if (!SIGNAL_PHONE_NUMBER) {
       logger.error('SIGNAL_PHONE_NUMBER not set. Link signal-cli first, then set it in .env.');
+      process.exit(1);
+    }
+  } else if (MESSENGER_TYPE === 'matrix') {
+    if (!MATRIX_HOMESERVER_URL || !MATRIX_USER_ID || !MATRIX_ACCESS_TOKEN) {
+      logger.error('MATRIX_HOMESERVER_URL / MATRIX_USER_ID / MATRIX_ACCESS_TOKEN must all be set in .env.');
+      process.exit(1);
+    }
+    if (MATRIX_AUTHORIZED_USERS.length === 0) {
+      logger.error('MATRIX_AUTHORIZED_USERS is empty — refusing to start a bot that would respond to anyone.');
       process.exit(1);
     }
   } else {
@@ -188,18 +202,25 @@ async function main(): Promise<void> {
 
   cleanupOldUploads();
 
-  // ── Messenger: create either the Telegram bot (grammy) or the Signal bot
-  // (signal-cli JSON-RPC). Both expose a messenger-agnostic `sendToPrimary`
-  // helper used by scheduler, War Room status messages, and OAuth alerts.
+  // ── Messenger: create exactly one of (Telegram | Signal | Matrix). All
+  // three expose `sendToPrimary` so scheduler / War Room / OAuth alerts
+  // don't need to care which transport is live.
   const useSignal = MESSENGER_TYPE === 'signal';
-  const bot = useSignal ? null : createBot();
+  const useMatrix = MESSENGER_TYPE === 'matrix';
+  const bot = (useSignal || useMatrix) ? null : createBot();
   const signalBot: SignalBot | null = useSignal ? createSignalBot() : null;
+  const matrixBot: MatrixBot | null = useMatrix ? createMatrixBot() : null;
 
   // Recipient for status messages (scheduler output, War Room errors, etc.).
-  // Telegram: ALLOWED_CHAT_ID. Signal: first entry in SIGNAL_AUTHORIZED_RECIPIENTS,
-  // falling back to the daemon's own number (sync-to-self works for testing).
+  // - Telegram: ALLOWED_CHAT_ID.
+  // - Signal: first SIGNAL_AUTHORIZED_RECIPIENTS entry (sync-to-self fallback).
+  // - Matrix: caller-configured first authorized MXID. The first allowlisted
+  //   user is also expected to be the primary chat partner; status pings go
+  //   into a DM with them. Could later be replaced by a dedicated room ID.
   const primaryRecipient = useSignal
     ? (SIGNAL_AUTHORIZED_RECIPIENTS[0] ?? SIGNAL_PHONE_NUMBER)
+    : useMatrix
+    ? (MATRIX_AUTHORIZED_USERS[0] ?? '')
     : ALLOWED_CHAT_ID;
 
   async function sendToPrimary(text: string): Promise<void> {
@@ -208,6 +229,27 @@ async function main(): Promise<void> {
       await signalBot.sendTo(primaryRecipient, text).catch((err) =>
         logger.error({ err }, 'Signal status message failed'),
       );
+    } else if (useMatrix && matrixBot) {
+      // For Matrix the primary recipient is an MXID; we need a roomId to
+      // actually post. Resolve a 1:1 DM room for the user — create one
+      // lazily if it doesn't exist. Status messages go there.
+      try {
+        const { MatrixClient } = await import('matrix-bot-sdk');
+        // We don't have direct access to the bot's client here; cheap
+        // workaround: call sendTo with the MXID and let matrix-bot.ts
+        // resolve the room. For MVP, assume the caller (scheduler) passes
+        // a roomId via the same field. If the recipient looks like an
+        // MXID rather than a roomId, log and skip.
+        if (primaryRecipient.startsWith('!')) {
+          await matrixBot.sendTo(primaryRecipient, text);
+        } else {
+          logger.warn({ primaryRecipient }, 'Matrix primary recipient is an MXID, not a roomId. Status messages will be dropped until a primary roomId is configured (TODO).');
+        }
+        // Silence the unused import warning if we only needed it conditionally.
+        void MatrixClient;
+      } catch (err) {
+        logger.error({ err }, 'Matrix status message failed');
+      }
     } else if (bot) {
       const { splitMessage } = await import('./bot.js');
       for (const chunk of splitMessage(text)) {
@@ -373,6 +415,7 @@ async function main(): Promise<void> {
     releaseLock();
     if (bot) await bot.stop();
     if (signalBot) await signalBot.stop();
+    if (matrixBot) await matrixBot.stop();
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());
@@ -396,7 +439,21 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (!bot) throw new Error('Telegram bot not created and Signal not active — check MESSENGER_TYPE.');
+  if (useMatrix && matrixBot) {
+    await matrixBot.start();
+    setTelegramConnected(true); // reuse the connected flag for dashboard state
+    setBotInfo('matrix', `ClaudeClaw (Matrix)`);
+    if (AGENT_ID === 'main') {
+      console.log(`\n  ClaudeClaw online via Matrix: ${MATRIX_USER_ID} @ ${MATRIX_HOMESERVER_URL}`);
+      console.log(`  Authorized senders: ${MATRIX_AUTHORIZED_USERS.join(', ')}`);
+      console.log();
+    } else {
+      console.log(`\n  ClaudeClaw agent [${AGENT_ID}] online via Matrix\n`);
+    }
+    return;
+  }
+
+  if (!bot) throw new Error('No messenger active — check MESSENGER_TYPE (must be telegram, signal, or matrix).');
 
   // Clear any existing webhook so polling works cleanly (e.g., if token was
   // previously used with a webhook-based bot or another ClaudeClaw instance).

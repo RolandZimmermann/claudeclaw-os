@@ -12,6 +12,10 @@ const envConfig = readEnvFile([
   'SIGNAL_RPC_HOST',
   'SIGNAL_RPC_PORT',
   'SIGNAL_AUTHORIZED_RECIPIENTS',
+  'MATRIX_HOMESERVER_URL',
+  'MATRIX_USER_ID',
+  'MATRIX_ACCESS_TOKEN',
+  'MATRIX_AUTHORIZED_USERS',
   'GROQ_API_KEY',
   'ELEVENLABS_API_KEY',
   'ELEVENLABS_VOICE_ID',
@@ -86,10 +90,11 @@ export const ALLOWED_CHAT_ID =
   process.env.ALLOWED_CHAT_ID || envConfig.ALLOWED_CHAT_ID || '';
 
 // ── Messenger adapter selection ──────────────────────────────────────
-// Which messenger front-end runs: 'telegram' (default, grammy via bot.ts)
-// or 'signal' (signal-cli JSON-RPC via signal-bot.ts). Picked once at
-// startup in index.ts; the two code paths never run simultaneously.
-export type MessengerType = 'telegram' | 'signal';
+// Which messenger front-end runs: 'telegram' (default, grammy via bot.ts),
+// 'signal' (signal-cli JSON-RPC via signal-bot.ts), or 'matrix' (matrix-
+// bot-sdk via matrix-bot.ts, used for self-hosted Conduit/Synapse).
+// Picked once at startup in index.ts; only one messenger code path runs.
+export type MessengerType = 'telegram' | 'signal' | 'matrix';
 export const MESSENGER_TYPE: MessengerType =
   ((process.env.MESSENGER_TYPE || envConfig.MESSENGER_TYPE || 'telegram').toLowerCase() as MessengerType);
 
@@ -106,6 +111,23 @@ export const SIGNAL_RPC_PORT = parseInt(
 // else get dropped with a single audit entry. Usually just your own number.
 export const SIGNAL_AUTHORIZED_RECIPIENTS = (
   process.env.SIGNAL_AUTHORIZED_RECIPIENTS || envConfig.SIGNAL_AUTHORIZED_RECIPIENTS || ''
+).split(',').map((s) => s.trim()).filter(Boolean);
+
+// ── Matrix (self-hosted Conduit / Synapse) ───────────────────────────
+// Bot connects via long-lived access_token (no password). Generate one
+// by registering a dedicated bot account, then save /login response.
+export const MATRIX_HOMESERVER_URL =
+  process.env.MATRIX_HOMESERVER_URL || envConfig.MATRIX_HOMESERVER_URL || '';
+export const MATRIX_USER_ID =
+  process.env.MATRIX_USER_ID || envConfig.MATRIX_USER_ID || '';
+export const MATRIX_ACCESS_TOKEN =
+  process.env.MATRIX_ACCESS_TOKEN || envConfig.MATRIX_ACCESS_TOKEN || '';
+// Comma-separated list of allowed sender MXIDs (e.g.
+// "@roland:matrix.example.com,@partner:matrix.example.com"). Messages
+// from anyone else get dropped with a single audit entry. The bot also
+// only auto-joins rooms when invited by a user on this list.
+export const MATRIX_AUTHORIZED_USERS = (
+  process.env.MATRIX_AUTHORIZED_USERS || envConfig.MATRIX_AUTHORIZED_USERS || ''
 ).split(',').map((s) => s.trim()).filter(Boolean);
 
 export const WHATSAPP_ENABLED =
