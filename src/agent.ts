@@ -179,6 +179,8 @@ export async function runAgent(
   abortController?: AbortController,
   onStreamText?: (accumulatedText: string) => void,
   mcpAllowlist?: string[],
+  // Per-call cwd override (e.g. per-Matrix-room workdir). Falls back to agentCwd / PROJECT_ROOT.
+  cwdOverride?: string,
 ): Promise<AgentResult> {
   // Read secrets from .env without polluting process.env.
   // CLAUDE_CODE_OAUTH_TOKEN is optional — the subprocess finds auth via ~/.claude/
@@ -223,8 +225,12 @@ export async function runAgent(
   const typingInterval = setInterval(onTyping, 4000);
 
   try {
-    // Load MCP servers from project + user settings files, filtered by agent allowlist
-    const mcpServers = loadMcpServers(mcpAllowlist);
+    // Resolve effective cwd: per-call override > agentCwd > PROJECT_ROOT.
+    const effectiveCwd = cwdOverride ?? agentCwd ?? PROJECT_ROOT;
+
+    // Load MCP servers from project + user settings files, filtered by agent allowlist.
+    // Pass effectiveCwd so per-room project settings (.claude/settings.json) load correctly.
+    const mcpServers = loadMcpServers(mcpAllowlist, effectiveCwd);
     const mcpServerNames = Object.keys(mcpServers);
     logger.info(
       { sessionId: sessionId ?? 'new', messageLen: message.length, mcpServers: mcpServerNames },
@@ -237,9 +243,10 @@ export async function runAgent(
     for await (const event of query({
       prompt: singleTurn(message),
       options: {
-        // cwd = agent directory (if running as agent) or project root.
-        // Claude Code loads CLAUDE.md from cwd via settingSources: ['project'].
-        cwd: agentCwd ?? PROJECT_ROOT,
+        // cwd = per-call override (e.g. per-Matrix-room workdir) > agent directory
+        // (if running as agent) > project root. Claude Code loads CLAUDE.md from
+        // cwd via settingSources: ['project'].
+        cwd: effectiveCwd,
 
         // Resume the previous session for this chat (persistent context)
         resume: sessionId,
@@ -430,6 +437,8 @@ export async function runAgentWithRetry(
   onRetry?: (attempt: number, error: AgentError) => void,
   fallbackModels?: string[],
   mcpAllowlist?: string[],
+  // Per-call cwd override (e.g. per-Matrix-room workdir). Forwarded to runAgent.
+  cwdOverride?: string,
 ): Promise<AgentResult> {
   let lastError: AgentError | undefined;
 
@@ -444,7 +453,7 @@ export async function runAgentWithRetry(
       return await runAgent(
         message, sessionId, onTyping, onProgress,
         currentModel, abortController, onStreamText,
-        mcpAllowlist,
+        mcpAllowlist, cwdOverride,
       );
     } catch (err) {
       if (!(err instanceof AgentError)) throw err;

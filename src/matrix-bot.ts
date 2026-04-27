@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import yaml from 'js-yaml';
 import { MatrixClient, SimpleFsStorageProvider } from 'matrix-bot-sdk';
 
 import { runAgentWithRetry, AgentProgressEvent } from './agent.js';
@@ -9,6 +10,7 @@ import { AgentError } from './errors.js';
 import {
   AGENT_ID,
   AGENT_TIMEOUT_MS,
+  CLAUDECLAW_CONFIG,
   DASHBOARD_PORT,
   DASHBOARD_TOKEN,
   DASHBOARD_URL,
@@ -74,6 +76,62 @@ const MATRIX_TYPING_REFRESH_MS = 25_000;
 
 // Per-chat (roomId) model override, same pattern as bot.ts/signal-bot.ts.
 const chatModelOverride = new Map<string, string>();
+
+/**
+ * Per-room config loaded from rooms.yaml. Currently only `cwd` (working
+ * directory the agent runs in for this room) and an optional human label.
+ * Extend here if more per-room knobs are needed (model, system prompt, etc.).
+ */
+interface RoomConfig {
+  cwd: string;
+  label?: string;
+}
+
+/**
+ * Load `${CLAUDECLAW_CONFIG}/rooms.yaml` into a Map<roomId, RoomConfig>.
+ * Override path with MATRIX_ROOM_CWD_FILE for tests. Missing/empty file
+ * returns an empty map (callers fall back to default cwd silently).
+ *
+ * Schema (room IDs use Conduit's short form — no `:homeserver` suffix —
+ * because that's what matrix-bot-sdk hands us in event handlers):
+ *   rooms:
+ *     "!abc...":
+ *       cwd: /home/customers/foo
+ *       label: "Foo customer"
+ */
+function loadRoomConfigs(): Map<string, RoomConfig> {
+  const roomCfgFile =
+    process.env.MATRIX_ROOM_CWD_FILE ||
+    path.join(CLAUDECLAW_CONFIG, 'rooms.yaml');
+  const map = new Map<string, RoomConfig>();
+  let raw: string;
+  try {
+    raw = fs.readFileSync(roomCfgFile, 'utf-8');
+  } catch {
+    logger.info({ roomCfgFile }, 'No rooms.yaml found — per-room cwd disabled');
+    return map;
+  }
+  try {
+    const parsed = yaml.load(raw) as { rooms?: Record<string, Partial<RoomConfig>> } | null;
+    const rooms = parsed?.rooms;
+    if (!rooms || typeof rooms !== 'object') {
+      logger.warn({ roomCfgFile }, 'rooms.yaml has no top-level "rooms" map — ignoring');
+      return map;
+    }
+    for (const [roomId, cfg] of Object.entries(rooms)) {
+      if (!cfg || typeof cfg !== 'object') continue;
+      if (!cfg.cwd || typeof cfg.cwd !== 'string') {
+        logger.warn({ roomId }, 'rooms.yaml entry missing string `cwd` — skipping');
+        continue;
+      }
+      map.set(roomId, { cwd: cfg.cwd, label: typeof cfg.label === 'string' ? cfg.label : undefined });
+    }
+    logger.info({ roomCfgFile, count: map.size }, 'Loaded room configs from rooms.yaml');
+  } catch (err) {
+    logger.warn({ err, roomCfgFile }, 'Failed to parse rooms.yaml — per-room cwd disabled');
+  }
+  return map;
+}
 
 // Per-chat voice-reply preference. Three states:
 //   'on'    → always reply as TTS, even for typed prompts
@@ -225,6 +283,10 @@ export function createMatrixBot(): MatrixBot {
   const storage = new SimpleFsStorageProvider(path.join(storageDir, 'bot.json'));
 
   const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, storage);
+
+  // Per-room cwd map, loaded once at startup. Rooms not in this map fall
+  // back to the agent's default cwd (PROJECT_ROOT).
+  const roomConfigs = loadRoomConfigs();
 
   // Voice STT/TTS capability is fixed at process start (env-driven); cache
   // once instead of probing on every message.
@@ -450,6 +512,15 @@ export function createMatrixBot(): MatrixBot {
 
       const fullMessage = parts.join('\n\n');
 
+      // Per-room workdir: if rooms.yaml maps this roomId to a cwd, the agent
+      // runs there (giving it access to that customer's repo). Otherwise the
+      // agent uses its default cwd — behaviour for unmapped rooms is unchanged.
+      const roomCfg = roomConfigs.get(chatId);
+      const roomCwd = roomCfg?.cwd;
+      if (roomCwd) {
+        logger.debug({ chatId, roomCwd, label: roomCfg?.label }, 'Using per-room cwd');
+      }
+
       const result = await runAgentWithRetry(
         fullMessage,
         sessionId,
@@ -463,6 +534,7 @@ export function createMatrixBot(): MatrixBot {
         },
         MODEL_FALLBACK_CHAIN.length > 0 ? MODEL_FALLBACK_CHAIN : undefined,
         agentMcpAllowlist,
+        roomCwd,
       );
 
       clearTimeout(timeoutId);
