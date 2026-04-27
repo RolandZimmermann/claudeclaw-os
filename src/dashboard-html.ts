@@ -1012,7 +1012,7 @@ async function loadHealth() {
     const tgPill = document.getElementById('tg-pill');
     // Relabel based on active messenger — the element id stays 'tg-pill'
     // for back-compat with pre-Signal builds, but Signal users see "Signal".
-    var messengerLabel = (data.messengerType || 'telegram') === 'signal' ? 'Signal' : 'Telegram';
+    var messengerLabel = ({signal:'Signal',matrix:'Matrix',telegram:'Telegram'})[data.messengerType] || 'Telegram';
     tgPill.textContent = messengerLabel;
     var isConnected = data.messengerConnected !== undefined ? data.messengerConnected : data.telegramConnected;
     tgPill.className = 'pill ' + (isConnected ? 'pill-connected' : 'pill-disconnected');
