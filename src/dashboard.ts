@@ -146,13 +146,13 @@ export function startDashboard(botApi?: Api<RawApi>): void {
 
   // Serve dashboard HTML
   app.get('/', (c) => {
-    const chatId = c.req.query('chatId') || '';
+    const chatId = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
     return c.html(getDashboardHtml(DASHBOARD_TOKEN, chatId, WARROOM_ENABLED));
   });
 
   // War Room page
   app.get('/warroom', (c) => {
-    const chatId = c.req.query('chatId') || '';
+    const chatId = c.req.query('chatId') || ALLOWED_CHAT_ID || '';
     return c.html(getWarRoomHtml(DASHBOARD_TOKEN, chatId, WARROOM_PORT));
   });
 
