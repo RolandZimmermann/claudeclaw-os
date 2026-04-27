@@ -214,6 +214,20 @@ const voiceMode = new Map<string, 'on' | 'off'>();
 // (process). Avoids one /state round-trip per incoming message.
 const roomEncryptionCache = new Map<string, boolean>();
 
+// Text-message coalescing: when Roland fires a follow-up message within a
+// few seconds of the first, we want the bot to combine them into ONE prompt
+// instead of starting a separate agent run for each ping. The buffer holds
+// in-flight text + the user's event-ids (for reactions). Voice/file paths
+// don't use this — they're rarely sent in bursts and have their own queues.
+const TEXT_COALESCE_WINDOW_MS = 6000;
+interface TextBuffer {
+  texts: string[];
+  eventIds: string[];
+  ackReactions: (string | null)[];
+  timer: NodeJS.Timeout | null;
+}
+const textBuffers = new Map<string, TextBuffer>();
+
 interface MatrixMessageEvent {
   event_id: string;
   sender: string;
@@ -526,6 +540,9 @@ export function createMatrixBot(): MatrixBot {
     forceVoiceReply = false,
     /** Event id of the user message; used to attach reactions for visible progress. */
     sourceEventId?: string,
+    /** Coalesce caller hook: receives runOk so the caller can manage reactions
+     *  across multiple buffered user messages instead of just one. */
+    onComplete?: (runOk: boolean) => void | Promise<void>,
   ): Promise<void> {
     const chatId = roomId;
 
@@ -619,15 +636,18 @@ export function createMatrixBot(): MatrixBot {
 
     // ⏳ reaction on the user's message: gives them an instant "yes, the bot
     // saw your message and is working on it" signal. Redacted (and replaced
-    // with ✅ / ❌) in the finally block.
+    // with ✅ / ❌) in the finally block. Skipped if a caller-side onComplete
+    // is provided (the coalesce path manages reactions across the batch).
     let pendingReactionId: string | null = null;
-    if (sourceEventId) {
+    if (sourceEventId && !onComplete) {
       pendingReactionId = await addReaction(chatId, sourceEventId, '⏳');
     }
 
-    // Tool-progress throttle: every Nth second post a "still working: <tool>"
-    // line so a long agent query doesn't look stuck. Skip if same tool repeats.
-    const TOOL_PROGRESS_MIN_INTERVAL_MS = 60_000;
+    // Tool-progress: post a "still working: <tool>" line whenever the tool
+    // CHANGES (instant) OR every Nth second if the same tool keeps running.
+    // Lower-than-default interval makes long agent runs feel alive instead
+    // of opaque, at the cost of more chat noise — Roland asked for verbose.
+    const TOOL_PROGRESS_MIN_INTERVAL_MS = 15_000;
     let lastToolNote = 0;
     let lastToolDesc = '';
 
@@ -640,10 +660,9 @@ export function createMatrixBot(): MatrixBot {
         if (event.type === 'task_completed') void sendMessage(chatId, `✓ ${event.description}`);
         if (event.type === 'tool_active') {
           const now = Date.now();
-          if (
-            event.description !== lastToolDesc &&
-            now - lastToolNote >= TOOL_PROGRESS_MIN_INTERVAL_MS
-          ) {
+          const changed = event.description !== lastToolDesc;
+          const intervalUp = now - lastToolNote >= TOOL_PROGRESS_MIN_INTERVAL_MS;
+          if (changed || intervalUp) {
             lastToolNote = now;
             lastToolDesc = event.description;
             void sendMessage(chatId, `⚙️ ${event.description}`);
@@ -790,10 +809,14 @@ export function createMatrixBot(): MatrixBot {
       setProcessing(chatId, false);
       await stopTyping(chatId);
       // Swap ⏳ → ✅ / ❌ on the user's message so they have a single
-      // visible "is the bot still working?" signal at a glance.
-      if (sourceEventId) {
+      // visible "is the bot still working?" signal at a glance. Skipped
+      // when an onComplete hook is provided (caller does it across the batch).
+      if (sourceEventId && !onComplete) {
         if (pendingReactionId) await redact(chatId, pendingReactionId);
         await addReaction(chatId, sourceEventId, runOk ? '✅' : '❌');
+      }
+      if (onComplete) {
+        try { await onComplete(runOk); } catch (err) { logger.warn({ err }, 'onComplete hook threw'); }
       }
     }
   }
@@ -1041,6 +1064,31 @@ export function createMatrixBot(): MatrixBot {
   }
 
   /**
+   * Drain the per-room text buffer: combines pending text into one prompt,
+   * runs the agent once, then sweeps ⏳ → ✅/❌ on every message in the batch.
+   * Called from a setTimeout once Roland stops typing for COALESCE_WINDOW_MS.
+   */
+  const flushTextBuffer = async (roomId: string): Promise<void> => {
+    const buf = textBuffers.get(roomId);
+    if (!buf) return;
+    textBuffers.delete(roomId);
+    const combined = buf.texts.join('\n\n');
+    const lastEventId = buf.eventIds[buf.eventIds.length - 1];
+    messageQueue.enqueue(roomId, async () => {
+      let runOk = false;
+      await handleTextMessage(roomId, combined, false, undefined, (ok) => { runOk = ok; });
+      // Swap the ⏳s we attached on each user message to ✅/❌. Element shows
+      // the per-message reaction, so doing all of them keeps the visual story
+      // coherent ("each thing I sent got handled").
+      for (let i = 0; i < buf.eventIds.length; i++) {
+        const reactionId = buf.ackReactions[i];
+        if (reactionId) await redact(roomId, reactionId);
+      }
+      await addReaction(roomId, lastEventId, runOk ? '✅' : '❌');
+    });
+  };
+
+  /**
    * Allowlist-gated invite handler. Replaces matrix-bot-sdk's
    * AutojoinRoomsMixin with a strict variant.
    */
@@ -1171,7 +1219,25 @@ export function createMatrixBot(): MatrixBot {
       if (handled) return;
     }
 
-    messageQueue.enqueue(roomId, () => handleTextMessage(roomId, text, false, event.event_id));
+    // Coalesce text bursts into one prompt: instant ⏳ feedback per message,
+    // but the agent only runs once after the user pauses for the window.
+    const ackId = await addReaction(roomId, event.event_id, '⏳');
+    const existing = textBuffers.get(roomId);
+    if (existing && existing.timer) {
+      clearTimeout(existing.timer);
+      existing.texts.push(text);
+      existing.eventIds.push(event.event_id);
+      existing.ackReactions.push(ackId);
+    } else {
+      textBuffers.set(roomId, {
+        texts: [text],
+        eventIds: [event.event_id],
+        ackReactions: [ackId],
+        timer: null,
+      });
+    }
+    const buf = textBuffers.get(roomId)!;
+    buf.timer = setTimeout(() => void flushTextBuffer(roomId), TEXT_COALESCE_WINDOW_MS);
   };
 
   // matrix-bot-sdk's start() returns immediately after registering the sync
