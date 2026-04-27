@@ -454,9 +454,20 @@ export function createMatrixBot(): MatrixBot {
     mxcUrl: string,
     contentType: string | undefined,
   ): Promise<string> => {
-    const resp = await client.downloadContent(mxcUrl);
-    // matrix-bot-sdk 0.7+ returns { data: Buffer, contentType: string }.
-    const buf: Buffer = Buffer.isBuffer(resp) ? resp : (resp as { data: Buffer }).data;
+    // matrix-bot-sdk 0.7's client.downloadContent() still hits the
+    // pre-Matrix-1.11 unauthenticated media endpoint, which Conduit 0.10+
+    // returns 404 on. Talk to the new authenticated endpoint directly.
+    const m = mxcUrl.match(/^mxc:\/\/([^/]+)\/(.+)$/);
+    if (!m) throw new Error(`invalid mxc url: ${mxcUrl}`);
+    const [, server, mediaId] = m;
+    const url = `${MATRIX_HOMESERVER_URL}/_matrix/client/v1/media/download/${server}/${mediaId}`;
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${MATRIX_ACCESS_TOKEN}` },
+    });
+    if (!resp.ok) {
+      throw new Error(`media download HTTP ${resp.status} ${resp.statusText}`);
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
     const ext = fileExtFromMime(contentType, '.bin');
     return writeTempFile(buf, ext);
   };
