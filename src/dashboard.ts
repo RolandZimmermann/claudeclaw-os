@@ -135,10 +135,19 @@ export function startDashboard(botApi?: Api<RawApi>): void {
     return c.json({ error: 'Internal server error' }, 500);
   });
 
-  // Token auth middleware
+  // Token auth middleware. Two paths in:
+  //   (1) ?token=… (legacy direct access, used by the JS to call the API)
+  //   (2) X-Authentik-Username header (Authentik forward-auth set this — if
+  //       it's present, the request already passed Authentik and we can
+  //       skip the token check). Lets mobile bookmarks like
+  //       https://dashboard.example.com/ work after Authentik SSO without
+  //       the user having to remember the token in the URL.
   app.use('*', async (c, next) => {
     const token = c.req.query('token');
-    if (!DASHBOARD_TOKEN || !token || token !== DASHBOARD_TOKEN) {
+    const authentikUser = c.req.header('x-authentik-username');
+    const tokenOk = DASHBOARD_TOKEN && token && token === DASHBOARD_TOKEN;
+    const authentikOk = !!authentikUser;
+    if (!tokenOk && !authentikOk) {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     await next();
