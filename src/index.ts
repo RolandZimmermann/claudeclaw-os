@@ -6,7 +6,7 @@ import { createBot } from './bot.js';
 import { createSignalBot, SignalBot } from './signal-bot.js';
 import { createMatrixBot, MatrixBot } from './matrix-bot.js';
 import { checkPendingMigrations } from './migrations.js';
-import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT, MESSENGER_TYPE, SIGNAL_AUTHORIZED_RECIPIENTS, SIGNAL_PHONE_NUMBER, MATRIX_HOMESERVER_URL, MATRIX_USER_ID, MATRIX_ACCESS_TOKEN, MATRIX_AUTHORIZED_USERS } from './config.js';
+import { ALLOWED_CHAT_ID, activeBotToken, STORE_DIR, PROJECT_ROOT, CLAUDECLAW_CONFIG, GOOGLE_API_KEY, setAgentOverrides, SECURITY_PIN_HASH, IDLE_LOCK_MINUTES, EMERGENCY_KILL_PHRASE, WARROOM_ENABLED, WARROOM_PORT, MESSENGER_TYPE, SIGNAL_AUTHORIZED_RECIPIENTS, SIGNAL_PHONE_NUMBER, MATRIX_HOMESERVER_URL, MATRIX_USER_ID, MATRIX_ACCESS_TOKEN, MATRIX_AUTHORIZED_USERS, MATRIX_PRIMARY_ROOM_ID } from './config.js';
 import { startDashboard } from './dashboard.js';
 import { initDatabase, cleanupOldMissionTasks, insertAuditLog } from './db.js';
 import { initSecurity, setAuditCallback } from './security.js';
@@ -212,16 +212,20 @@ async function main(): Promise<void> {
   const matrixBot: MatrixBot | null = useMatrix ? createMatrixBot() : null;
 
   // Recipient for status messages (scheduler output, War Room errors, etc.).
-  // - Telegram: ALLOWED_CHAT_ID.
+  // - Telegram: ALLOWED_CHAT_ID (chat ID).
   // - Signal: first SIGNAL_AUTHORIZED_RECIPIENTS entry (sync-to-self fallback).
-  // - Matrix: caller-configured first authorized MXID. The first allowlisted
-  //   user is also expected to be the primary chat partner; status pings go
-  //   into a DM with them. Could later be replaced by a dedicated room ID.
+  // - Matrix: MATRIX_PRIMARY_ROOM_ID (roomId, must start with "!"). Without
+  //   it, scheduler/War Room/OAuth-health pings have nowhere to land — we
+  //   warn at startup and they're skipped.
   const primaryRecipient = useSignal
     ? (SIGNAL_AUTHORIZED_RECIPIENTS[0] ?? SIGNAL_PHONE_NUMBER)
     : useMatrix
-    ? (MATRIX_AUTHORIZED_USERS[0] ?? '')
+    ? MATRIX_PRIMARY_ROOM_ID
     : ALLOWED_CHAT_ID;
+
+  if (useMatrix && !MATRIX_PRIMARY_ROOM_ID) {
+    logger.warn('MATRIX_PRIMARY_ROOM_ID not set — scheduler, OAuth-health, and War Room status messages will be skipped. Set it to a roomId (starts with "!") to enable.');
+  }
 
   async function sendToPrimary(text: string): Promise<void> {
     if (!primaryRecipient) return;
@@ -230,26 +234,9 @@ async function main(): Promise<void> {
         logger.error({ err }, 'Signal status message failed'),
       );
     } else if (useMatrix && matrixBot) {
-      // For Matrix the primary recipient is an MXID; we need a roomId to
-      // actually post. Resolve a 1:1 DM room for the user — create one
-      // lazily if it doesn't exist. Status messages go there.
-      try {
-        const { MatrixClient } = await import('matrix-bot-sdk');
-        // We don't have direct access to the bot's client here; cheap
-        // workaround: call sendTo with the MXID and let matrix-bot.ts
-        // resolve the room. For MVP, assume the caller (scheduler) passes
-        // a roomId via the same field. If the recipient looks like an
-        // MXID rather than a roomId, log and skip.
-        if (primaryRecipient.startsWith('!')) {
-          await matrixBot.sendTo(primaryRecipient, text);
-        } else {
-          logger.warn({ primaryRecipient }, 'Matrix primary recipient is an MXID, not a roomId. Status messages will be dropped until a primary roomId is configured (TODO).');
-        }
-        // Silence the unused import warning if we only needed it conditionally.
-        void MatrixClient;
-      } catch (err) {
-        logger.error({ err }, 'Matrix status message failed');
-      }
+      await matrixBot.sendTo(primaryRecipient, text).catch((err) =>
+        logger.error({ err }, 'Matrix status message failed'),
+      );
     } else if (bot) {
       const { splitMessage } = await import('./bot.js');
       for (const chunk of splitMessage(text)) {

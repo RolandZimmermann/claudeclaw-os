@@ -81,9 +81,9 @@ const chatModelOverride = new Map<string, string>();
 //   unset   → default: mirror the incoming modality
 const voiceMode = new Map<string, 'on' | 'off'>();
 
-// Track rooms we've decided NOT to process (encrypted rooms etc.) so we
-// stop nagging on every message.
-const skippedRooms = new Set<string>();
+// Cache of room encryption status. `true` = E2EE (skip), `false` = plain
+// (process). Avoids one /state round-trip per incoming message.
+const roomEncryptionCache = new Map<string, boolean>();
 
 interface MatrixMessageEvent {
   event_id: string;
@@ -226,6 +226,10 @@ export function createMatrixBot(): MatrixBot {
 
   const client = new MatrixClient(MATRIX_HOMESERVER_URL, MATRIX_ACCESS_TOKEN, storage);
 
+  // Voice STT/TTS capability is fixed at process start (env-driven); cache
+  // once instead of probing on every message.
+  const voiceCaps = voiceCapabilities();
+
   /** Send plain-text message, splitting if too long. */
   const sendMessage = async (roomId: string, text: string): Promise<void> => {
     for (const part of splitMessage(text)) {
@@ -314,26 +318,28 @@ export function createMatrixBot(): MatrixBot {
     return writeTempFile(buf, ext);
   };
 
-  /** Read m.room.encryption state — true if the room is E2EE. */
+  /** Read m.room.encryption state — true if the room is E2EE. Cached. */
   const isRoomEncrypted = async (roomId: string): Promise<boolean> => {
+    const cached = roomEncryptionCache.get(roomId);
+    if (cached !== undefined) return cached;
+    let encrypted = false;
     try {
       const ev = await client.getRoomStateEvent(roomId, 'm.room.encryption', '');
-      return !!(ev && (ev as { algorithm?: string }).algorithm);
+      encrypted = !!(ev && (ev as { algorithm?: string }).algorithm);
     } catch {
-      return false;
+      encrypted = false;
     }
+    roomEncryptionCache.set(roomId, encrypted);
+    return encrypted;
   };
 
   /**
    * Core message handler — ported from signal-bot.ts handleTextMessage().
-   * `chatId` here is the Matrix roomId. Authorization is checked at the
-   * outer event listener; by the time we land here, the sender is known
-   * to be allowlisted.
+   * `chatId` is the Matrix roomId. Authorization is checked at the outer
+   * event listener; by the time we land here, the sender is allowlisted.
    */
   async function handleTextMessage(
     roomId: string,
-    sender: string,
-    eventId: string,
     message: string,
     forceVoiceReply = false,
   ): Promise<void> {
@@ -421,7 +427,7 @@ export function createMatrixBot(): MatrixBot {
     const userModel = chatModelOverride.get(chatId) ?? agentDefaultModel;
     const effectiveModel = (SMART_ROUTING_ENABLED && !userModel && classifyMessageComplexity(message) === 'simple')
       ? SMART_ROUTING_CHEAP_MODEL
-      : (userModel ?? 'claude-opus-4-6');
+      : (userModel ?? agentDefaultModel ?? 'claude-opus-4-6');
 
     void sendTyping(chatId);
     const typingInterval = setInterval(() => void sendTyping(chatId), MATRIX_TYPING_REFRESH_MS);
@@ -503,9 +509,8 @@ export function createMatrixBot(): MatrixBot {
       }
 
       const textWithFooter = responseText ? responseText + costFooter : '';
-      const caps = voiceCapabilities();
       const mode = voiceMode.get(chatId);
-      const shouldSpeakBack = caps.tts && (
+      const shouldSpeakBack = voiceCaps.tts && (
         mode === 'on' || (mode !== 'off' && forceVoiceReply)
       );
 
@@ -543,7 +548,7 @@ export function createMatrixBot(): MatrixBot {
   }
 
   /** Dispatch a bare /command. Returns true if handled. */
-  async function handleCommand(roomId: string, sender: string, eventId: string, text: string): Promise<boolean> {
+  async function handleCommand(roomId: string, text: string): Promise<boolean> {
     const chatId = roomId;
     const match = text.match(/^\/(\w+)(?:\s+(.*))?$/s);
     if (!match) return false;
@@ -609,8 +614,7 @@ export function createMatrixBot(): MatrixBot {
       }
 
       case 'voice': {
-        const caps = voiceCapabilities();
-        if (!caps.tts) {
+        if (!voiceCaps.tts) {
           await sendMessage(chatId,
             'Voice replies not available. Configure one of:\n' +
             '  ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID\n' +
@@ -672,7 +676,7 @@ export function createMatrixBot(): MatrixBot {
       case 'delegate': {
         const rest = arg;
         if (!rest) { await sendMessage(chatId, 'Usage: /delegate <agent> <prompt>'); return true; }
-        await handleTextMessage(roomId, sender, eventId, `/delegate ${rest}`);
+        await handleTextMessage(roomId, `/delegate ${rest}`);
         return true;
       }
 
@@ -735,10 +739,11 @@ export function createMatrixBot(): MatrixBot {
     // Skip edits-of-edits (m.replace relations) — only react to fresh messages.
     if (event.content['m.relates_to']?.rel_type === 'm.replace') return;
 
-    // Encrypted rooms aren't supported in this MVP. Warn once per room.
+    // Encrypted rooms aren't supported in this MVP. The cache lets us
+    // skip the /state round-trip after the first message; warn once.
+    const wasCached = roomEncryptionCache.has(roomId);
     if (await isRoomEncrypted(roomId)) {
-      if (!skippedRooms.has(roomId)) {
-        skippedRooms.add(roomId);
+      if (!wasCached) {
         try {
           await sendMessage(roomId, 'This room is end-to-end encrypted. The bot does not yet support E2EE — disable encryption or move to a non-encrypted room.');
         } catch { /* room may itself be unreachable in plaintext */ }
@@ -757,8 +762,7 @@ export function createMatrixBot(): MatrixBot {
         await sendMessage(roomId, 'Got an audio message but no media URL. Try resending.');
         return;
       }
-      const caps = voiceCapabilities();
-      if (!caps.stt) {
+      if (!voiceCaps.stt) {
         await sendMessage(roomId,
           'Voice transcription not configured. Set GROQ_API_KEY for cloud STT or WHISPER_CPP_PATH/WHISPER_MODEL_PATH for local STT.',
         );
@@ -789,7 +793,7 @@ export function createMatrixBot(): MatrixBot {
         }
         logger.info({ roomId, len: transcript.length }, 'Matrix voice transcribed');
         emitChatEvent({ type: 'user_message', chatId: roomId, content: `[voice] ${transcript}`, source: 'matrix' });
-        await handleTextMessage(roomId, event.sender, event.event_id, transcript, /* forceVoiceReply */ true);
+        await handleTextMessage(roomId, transcript, /* forceVoiceReply */ true);
       });
       return;
     }
@@ -803,7 +807,7 @@ export function createMatrixBot(): MatrixBot {
         await sendMessage(roomId, 'Got the media. Add a caption (or send a follow-up message) and I’ll work with it.');
         return;
       }
-      messageQueue.enqueue(roomId, () => handleTextMessage(roomId, event.sender, event.event_id, caption));
+      messageQueue.enqueue(roomId, () => handleTextMessage(roomId, caption));
       return;
     }
 
@@ -815,12 +819,18 @@ export function createMatrixBot(): MatrixBot {
 
     // Commands first — they bypass the message queue so /stop can interrupt.
     if (text.startsWith('/')) {
-      const handled = await handleCommand(roomId, event.sender, event.event_id, text);
+      const handled = await handleCommand(roomId, text);
       if (handled) return;
     }
 
-    messageQueue.enqueue(roomId, () => handleTextMessage(roomId, event.sender, event.event_id, text));
+    messageQueue.enqueue(roomId, () => handleTextMessage(roomId, text));
   };
+
+  // matrix-bot-sdk's start() returns immediately after registering the sync
+  // promise chain; there's a window with no pending I/O during which Node
+  // would otherwise drain the event loop and exit. Hold a heartbeat timer
+  // so the process stays alive regardless of scheduler/dashboard state.
+  let keepAliveTimer: NodeJS.Timeout | null = null;
 
   return {
     async start(): Promise<void> {
@@ -836,12 +846,14 @@ export function createMatrixBot(): MatrixBot {
       });
 
       await client.start();
+      keepAliveTimer = setInterval(() => { /* hold event loop */ }, 60_000);
       logger.info(
         { homeserver: MATRIX_HOMESERVER_URL, userId: MATRIX_USER_ID, allowed: MATRIX_AUTHORIZED_USERS.length },
         'Matrix bot connected to homeserver',
       );
     },
     async stop(): Promise<void> {
+      if (keepAliveTimer) { clearInterval(keepAliveTimer); keepAliveTimer = null; }
       try {
         client.stop();
       } catch (err) {

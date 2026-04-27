@@ -16,6 +16,7 @@ const envConfig = readEnvFile([
   'MATRIX_USER_ID',
   'MATRIX_ACCESS_TOKEN',
   'MATRIX_AUTHORIZED_USERS',
+  'MATRIX_PRIMARY_ROOM_ID',
   'GROQ_API_KEY',
   'ELEVENLABS_API_KEY',
   'ELEVENLABS_VOICE_ID',
@@ -129,6 +130,11 @@ export const MATRIX_ACCESS_TOKEN =
 export const MATRIX_AUTHORIZED_USERS = (
   process.env.MATRIX_AUTHORIZED_USERS || envConfig.MATRIX_AUTHORIZED_USERS || ''
 ).split(',').map((s) => s.trim()).filter(Boolean);
+// Room ID where scheduler / OAuth-health / War Room status messages get
+// posted. A roomId, not an MXID — i.e. starts with "!" not "@". Without
+// this, those subsystems are silently disabled in the Matrix path.
+export const MATRIX_PRIMARY_ROOM_ID =
+  process.env.MATRIX_PRIMARY_ROOM_ID || envConfig.MATRIX_PRIMARY_ROOM_ID || '';
 
 export const WHATSAPP_ENABLED =
   (process.env.WHATSAPP_ENABLED || envConfig.WHATSAPP_ENABLED || '').toLowerCase() === 'true';
