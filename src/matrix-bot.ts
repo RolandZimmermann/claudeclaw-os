@@ -1032,16 +1032,32 @@ export function createMatrixBot(): MatrixBot {
       return;
     }
 
-    // ── Image / document — forward as text-with-context ─────────────────
+    // ── Image / document / video — download to /tmp, hand the path to Claude.
+    // Read tool ingests images and PDFs natively; Bash can run on anything else.
+    // Files persist for the container lifetime (good enough for one-task use).
     if (msgtype === 'm.image' || msgtype === 'm.file' || msgtype === 'm.video') {
-      // Treat the media as an attachment: caption (body) becomes the prompt.
-      // If no caption, ack the media without invoking the agent.
-      const caption = body.trim();
-      if (!caption) {
-        await sendMessage(roomId, 'Got the media. Add a caption (or send a follow-up message) and I’ll work with it.');
+      const mxcUrl = event.content.url ?? event.content.file?.url;
+      if (!mxcUrl) {
+        await sendMessage(roomId, 'Got the media event but no URL. Try resending.');
         return;
       }
-      messageQueue.enqueue(roomId, () => handleTextMessage(roomId, caption));
+      const caption = body.trim();
+      const kind = msgtype === 'm.image' ? 'image' : msgtype === 'm.video' ? 'video' : 'file';
+      messageQueue.enqueue(roomId, async () => {
+        let filePath: string;
+        try {
+          filePath = await downloadMxcToTempFile(mxcUrl, event.content?.info?.mimetype);
+        } catch (err) {
+          logger.error({ err, mxcUrl }, 'Media download failed (Matrix)');
+          await sendMessage(roomId, `Could not download the ${kind}. Try resending.`);
+          return;
+        }
+        const promptParts = [
+          `[Attached ${kind} at: ${filePath}]`,
+          caption || `(No caption — describe or summarise this ${kind}.)`,
+        ];
+        await handleTextMessage(roomId, promptParts.join('\n\n'));
+      });
       return;
     }
 
