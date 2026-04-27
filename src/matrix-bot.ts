@@ -3,6 +3,7 @@ import os from 'os';
 import path from 'path';
 
 import yaml from 'js-yaml';
+import { Marked } from 'marked';
 import { MatrixClient, SimpleFsStorageProvider } from 'matrix-bot-sdk';
 
 import { runAgentWithRetry, AgentProgressEvent } from './agent.js';
@@ -78,6 +79,49 @@ const MATRIX_TYPING_REFRESH_MS = 25_000;
 const chatModelOverride = new Map<string, string>();
 
 /**
+ * Single-writer lock for rooms.yaml updates. Concurrent /cwd commands from
+ * different rooms would race on read-mutate-write; we chain mutations onto
+ * one promise so they run sequentially. In-process only — fine for this
+ * single-bot deployment, would need a real lock in a multi-writer setup.
+ */
+let cwdWriteLock: Promise<void> = Promise.resolve();
+function withCwdWriteLock<T>(fn: () => T | Promise<T>): Promise<T> {
+  const next = cwdWriteLock.then(() => fn());
+  cwdWriteLock = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+/**
+ * Markdown → HTML renderer for Matrix `formatted_body`. Claude's responses
+ * use markdown (bold, lists, code blocks, headers, links, tables); Element
+ * renders Matrix custom-html, so we ship both. `gfm: true` enables GitHub
+ * extensions (tables, fenced code, autolinks); `breaks: true` turns single
+ * newlines into <br> so chat-style line breaks survive.
+ *
+ * The sender is trusted (Claude itself), so we don't pull in DOMPurify —
+ * just defensively strip <script> tags from the output as a last line of
+ * defence. Element/Matrix clients also sanitize on render.
+ */
+const markdown = new Marked({ gfm: true, breaks: true });
+
+/** Render markdown text to a Matrix-safe HTML string. */
+function renderMarkdownToHtml(text: string): string {
+  let html: string;
+  try {
+    html = markdown.parse(text, { async: false }) as string;
+  } catch (err) {
+    logger.warn({ err }, 'markdown render failed — falling back to escaped text');
+    html = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+  // Defensive: strip <script>...</script> blocks. Marked doesn't emit them
+  // from markdown but raw HTML inside the markdown could.
+  return html.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
+}
+
+/**
  * Per-room config loaded from rooms.yaml. Currently only `cwd` (working
  * directory the agent runs in for this room) and an optional human label.
  * Extend here if more per-room knobs are needed (model, system prompt, etc.).
@@ -99,10 +143,35 @@ interface RoomConfig {
  *       cwd: /home/customers/foo
  *       label: "Foo customer"
  */
+/** Resolve the rooms.yaml path the same way the loader does. */
+function roomConfigFilePath(): string {
+  return process.env.MATRIX_ROOM_CWD_FILE || path.join(CLAUDECLAW_CONFIG, 'rooms.yaml');
+}
+
+/**
+ * Serialise a Map<roomId, RoomConfig> back to rooms.yaml. The write is
+ * atomic-ish (write-to-tmp + rename). NOTE: js-yaml does not preserve YAML
+ * comments — every save clobbers them. The /cwd reply warns the user.
+ *
+ * Concurrency: callers must serialise calls (cwdWriteLock below). We do not
+ * do file-locking; multiple bot processes writing to the same file at once
+ * would still race. In practice all writes come from the main bot only.
+ */
+function saveRoomConfigs(map: Map<string, RoomConfig>): void {
+  const file = roomConfigFilePath();
+  const rooms: Record<string, RoomConfig> = {};
+  for (const [roomId, cfg] of map.entries()) {
+    rooms[roomId] = cfg.label ? { cwd: cfg.cwd, label: cfg.label } : { cwd: cfg.cwd };
+  }
+  const yamlStr = yaml.dump({ rooms }, { indent: 2, lineWidth: 120, quotingType: '"' });
+  const tmp = `${file}.tmp`;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(tmp, yamlStr, 'utf-8');
+  fs.renameSync(tmp, file);
+}
+
 function loadRoomConfigs(): Map<string, RoomConfig> {
-  const roomCfgFile =
-    process.env.MATRIX_ROOM_CWD_FILE ||
-    path.join(CLAUDECLAW_CONFIG, 'rooms.yaml');
+  const roomCfgFile = roomConfigFilePath();
   const map = new Map<string, RoomConfig>();
   let raw: string;
   try {
@@ -292,11 +361,23 @@ export function createMatrixBot(): MatrixBot {
   // once instead of probing on every message.
   const voiceCaps = voiceCapabilities();
 
-  /** Send plain-text message, splitting if too long. */
+  /**
+   * Send a markdown message: rendered to HTML for Matrix-formatted clients
+   * (Element renders bold/code/lists/etc.) with the original markdown kept
+   * as plaintext fallback. Splits long text first, then renders per chunk
+   * so the HTML stays well-formed in each part.
+   */
   const sendMessage = async (roomId: string, text: string): Promise<void> => {
+    if (!text || !text.trim()) return;
     for (const part of splitMessage(text)) {
+      const html = renderMarkdownToHtml(part);
       try {
-        await client.sendMessage(roomId, { msgtype: 'm.text', body: part });
+        await client.sendMessage(roomId, {
+          msgtype: 'm.text',
+          body: part,
+          format: 'org.matrix.custom.html',
+          formatted_body: html,
+        });
       } catch (err) {
         logger.error({ err, roomId }, 'matrix send failed');
         // Don't throw — a dropped message must not crash the receive loop.
@@ -642,6 +723,7 @@ export function createMatrixBot(): MatrixBot {
           '/unpin <id> — Unpin a memory\n' +
           '/voice on|off|auto — Voice replies: always / never / mirror input\n' +
           '/model <opus|sonnet|haiku> — Switch model\n' +
+          '/cwd [<path>|unset] — Show or set this room\'s working directory\n' +
           '/agents — List available agents\n' +
           '/delegate <agent> <prompt> — Delegate to an agent\n' +
           '/dashboard — Get dashboard link\n' +
@@ -723,6 +805,86 @@ export function createMatrixBot(): MatrixBot {
         if (!target) { await sendMessage(chatId, 'Unknown model. Use opus, sonnet, or haiku.'); return true; }
         chatModelOverride.set(chatId, target);
         await sendMessage(chatId, `Model switched to ${target}.`);
+        return true;
+      }
+
+      case 'cwd': {
+        // No arg → show current cwd for this room.
+        if (!arg) {
+          const cfg = roomConfigs.get(chatId);
+          if (cfg) {
+            const labelStr = cfg.label ? ` (${cfg.label})` : '';
+            await sendMessage(chatId,
+              `Current container cwd for this room: \`${cfg.cwd}\`${labelStr}\n\n` +
+              'Set with `/cwd <absolute-path>` or remove with `/cwd unset`.');
+          } else {
+            await sendMessage(chatId,
+              'No override — using default agent cwd.\n\n' +
+              'Set with `/cwd <absolute-path>` (path must exist inside the bot container).');
+          }
+          return true;
+        }
+
+        // Clear / unset.
+        if (arg === 'unset' || arg === 'clear') {
+          if (!roomConfigs.has(chatId)) {
+            await sendMessage(chatId, 'No override to clear — already using default agent cwd.');
+            return true;
+          }
+          await withCwdWriteLock(() => {
+            // Re-read on disk in case external edits happened, then remove.
+            const fresh = loadRoomConfigs();
+            fresh.delete(chatId);
+            roomConfigs.delete(chatId);
+            // Merge in any other in-memory entries fresh missed (shouldn't
+            // happen, but stay safe): in-memory is authoritative.
+            for (const [rid, cfg] of roomConfigs.entries()) fresh.set(rid, cfg);
+            saveRoomConfigs(fresh);
+          });
+          await sendMessage(chatId,
+            'Workdir override cleared. This room now uses the default agent cwd.\n\n' +
+            'Note: rooms.yaml comments were rewritten on save.');
+          return true;
+        }
+
+        // Set.
+        const targetPath = arg;
+        if (!path.isAbsolute(targetPath)) {
+          await sendMessage(chatId,
+            'Path must be absolute (start with `/`).\n\n' +
+            'Usage: `/cwd /home/customers/<name>` — paths refer to the bot CONTAINER, not your host.');
+          return true;
+        }
+        if (!fs.existsSync(targetPath)) {
+          await sendMessage(chatId,
+            `Path not found inside the bot container: \`${targetPath}\`. Mount it via docker-compose first ` +
+            '(e.g. add it under `/home/customers/` on the host and restart the bot).');
+          return true;
+        }
+        try {
+          await withCwdWriteLock(() => {
+            const fresh = loadRoomConfigs();
+            const existing = fresh.get(chatId) ?? roomConfigs.get(chatId);
+            const label = existing?.label ?? path.basename(targetPath);
+            const cfg: RoomConfig = { cwd: targetPath, label };
+            fresh.set(chatId, cfg);
+            roomConfigs.set(chatId, cfg);
+            // Make sure any other in-memory entries the loader might miss
+            // (e.g. if the file was deleted) survive the round-trip.
+            for (const [rid, rcfg] of roomConfigs.entries()) {
+              if (!fresh.has(rid)) fresh.set(rid, rcfg);
+            }
+            saveRoomConfigs(fresh);
+          });
+        } catch (err) {
+          logger.error({ err, roomId: chatId, targetPath }, '/cwd save failed');
+          const msg = err instanceof Error ? err.message : String(err);
+          await sendMessage(chatId, `Failed to save rooms.yaml: ${msg}`);
+          return true;
+        }
+        await sendMessage(chatId,
+          `Workdir for this room set to \`${targetPath}\` (container path). Effective on the next message.\n\n` +
+          'Saved. Note: rooms.yaml comments were rewritten.');
         return true;
       }
 
