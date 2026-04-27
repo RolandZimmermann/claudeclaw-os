@@ -447,6 +447,32 @@ export function createMatrixBot(): MatrixBot {
   };
 
   /**
+   * Send a single emoji reaction on `targetEventId`. Returns the reaction's
+   * own event id so we can redact it later (e.g. swap ⏳ → ✅ when done).
+   * Best-effort: failures get logged at debug, never thrown.
+   */
+  const addReaction = async (
+    roomId: string,
+    targetEventId: string,
+    emoji: string,
+  ): Promise<string | null> => {
+    try {
+      const id = await client.sendEvent(roomId, 'm.reaction', {
+        'm.relates_to': { rel_type: 'm.annotation', event_id: targetEventId, key: emoji },
+      });
+      return typeof id === 'string' ? id : null;
+    } catch (err) {
+      logger.warn({ err, roomId, emoji }, 'reaction send failed');
+      return null;
+    }
+  };
+
+  /** Best-effort redaction (used to remove ⏳ once the bot is done). */
+  const redact = async (roomId: string, eventId: string): Promise<void> => {
+    try { await client.redactEvent(roomId, eventId); } catch { /* ok */ }
+  };
+
+  /**
    * Convert mxc://server/mediaId to a downloadable HTTP URL on our homeserver,
    * then download the bytes. matrix-bot-sdk has `downloadContent` but the
    * exact return shape varies between versions; use a manual fetch for
@@ -498,6 +524,8 @@ export function createMatrixBot(): MatrixBot {
     roomId: string,
     message: string,
     forceVoiceReply = false,
+    /** Event id of the user message; used to attach reactions for visible progress. */
+    sourceEventId?: string,
   ): Promise<void> {
     const chatId = roomId;
 
@@ -589,12 +617,38 @@ export function createMatrixBot(): MatrixBot {
     const typingInterval = setInterval(() => void sendTyping(chatId), MATRIX_TYPING_REFRESH_MS);
     setProcessing(chatId, true);
 
+    // ⏳ reaction on the user's message: gives them an instant "yes, the bot
+    // saw your message and is working on it" signal. Redacted (and replaced
+    // with ✅ / ❌) in the finally block.
+    let pendingReactionId: string | null = null;
+    if (sourceEventId) {
+      pendingReactionId = await addReaction(chatId, sourceEventId, '⏳');
+    }
+
+    // Tool-progress throttle: every Nth second post a "still working: <tool>"
+    // line so a long agent query doesn't look stuck. Skip if same tool repeats.
+    const TOOL_PROGRESS_MIN_INTERVAL_MS = 60_000;
+    let lastToolNote = 0;
+    let lastToolDesc = '';
+
+    let runOk = false;
+
     try {
       const onProgress = (event: AgentProgressEvent): void => {
         emitChatEvent({ type: 'progress', chatId, description: event.description });
-        // Like signal-bot, only surface task boundaries — tool_active would flood.
         if (event.type === 'task_started') void sendMessage(chatId, `🔄 ${event.description}`);
         if (event.type === 'task_completed') void sendMessage(chatId, `✓ ${event.description}`);
+        if (event.type === 'tool_active') {
+          const now = Date.now();
+          if (
+            event.description !== lastToolDesc &&
+            now - lastToolNote >= TOOL_PROGRESS_MIN_INTERVAL_MS
+          ) {
+            lastToolNote = now;
+            lastToolDesc = event.description;
+            void sendMessage(chatId, `⚙️ ${event.description}`);
+          }
+        }
       };
 
       const abortCtrl = new AbortController();
@@ -723,6 +777,7 @@ export function createMatrixBot(): MatrixBot {
           await sendMessage(chatId, textWithFooter);
         }
       }
+      runOk = true;
     } catch (err) {
       clearInterval(typingInterval);
       setActiveAbort(chatId, null);
@@ -734,6 +789,12 @@ export function createMatrixBot(): MatrixBot {
     } finally {
       setProcessing(chatId, false);
       await stopTyping(chatId);
+      // Swap ⏳ → ✅ / ❌ on the user's message so they have a single
+      // visible "is the bot still working?" signal at a glance.
+      if (sourceEventId) {
+        if (pendingReactionId) await redact(chatId, pendingReactionId);
+        await addReaction(chatId, sourceEventId, runOk ? '✅' : '❌');
+      }
     }
   }
 
@@ -1064,7 +1125,7 @@ export function createMatrixBot(): MatrixBot {
         }
         logger.info({ roomId, len: transcript.length }, 'Matrix voice transcribed');
         emitChatEvent({ type: 'user_message', chatId: roomId, content: `[voice] ${transcript}`, source: 'matrix' });
-        await handleTextMessage(roomId, transcript, /* forceVoiceReply */ true);
+        await handleTextMessage(roomId, transcript, /* forceVoiceReply */ true, event.event_id);
       });
       return;
     }
@@ -1093,7 +1154,7 @@ export function createMatrixBot(): MatrixBot {
           `[Attached ${kind} at: ${filePath}]`,
           caption || `(No caption — describe or summarise this ${kind}.)`,
         ];
-        await handleTextMessage(roomId, promptParts.join('\n\n'));
+        await handleTextMessage(roomId, promptParts.join('\n\n'), false, event.event_id);
       });
       return;
     }
@@ -1110,7 +1171,7 @@ export function createMatrixBot(): MatrixBot {
       if (handled) return;
     }
 
-    messageQueue.enqueue(roomId, () => handleTextMessage(roomId, text));
+    messageQueue.enqueue(roomId, () => handleTextMessage(roomId, text, false, event.event_id));
   };
 
   // matrix-bot-sdk's start() returns immediately after registering the sync
