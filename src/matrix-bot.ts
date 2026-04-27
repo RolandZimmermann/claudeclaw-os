@@ -38,10 +38,12 @@ import {
   getRecentTaskOutputs,
   getSession,
   pinMemory,
+  saveTokenUsage,
   setSession,
   unpinMemory,
 } from './db.js';
 import { scanForSecrets, redactSecrets } from './exfiltration-guard.js';
+import { trackUsage } from './rate-tracker.js';
 import { logger } from './logger.js';
 import {
   MEMORY_NUDGE_TEXT,
@@ -645,6 +647,30 @@ export function createMatrixBot(): MatrixBot {
       }
 
       if (result.newSessionId) setSession(chatId, result.newSessionId, AGENT_ID);
+
+      // Persist token usage so dashboard /api/tokens has data and rate-tracker
+      // can enforce DAILY_COST_BUDGET / HOURLY_TOKEN_BUDGET. Same call shape as
+      // bot.ts (telegram). signal-bot.ts skips this — we follow bot.ts here
+      // because the dashboard is the primary surface for matrix users.
+      if (result.usage) {
+        const activeSessionId = result.newSessionId ?? sessionId;
+        try {
+          saveTokenUsage(
+            chatId,
+            activeSessionId,
+            result.usage.inputTokens,
+            result.usage.outputTokens,
+            result.usage.lastCallCacheRead,
+            result.usage.lastCallCacheRead + result.usage.lastCallInputTokens,
+            result.usage.totalCostUsd,
+            result.usage.didCompact,
+            AGENT_ID,
+          );
+        } catch (dbErr) {
+          logger.error({ err: dbErr }, 'Failed to save token usage (Matrix)');
+        }
+        trackUsage(result.usage.inputTokens + result.usage.outputTokens, result.usage.totalCostUsd);
+      }
 
       let rawResponse = result.text?.trim() || 'Done.';
 
